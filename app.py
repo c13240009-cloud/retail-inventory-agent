@@ -2,10 +2,11 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import math
 
-# =========================
-# KONFIGURASI HALAMAN
-# =========================
+# ==================================================
+# 1. KONFIGURASI HALAMAN
+# ==================================================
 st.set_page_config(
     page_title="Retail Inventory Agent",
     page_icon="📦",
@@ -14,29 +15,25 @@ st.set_page_config(
 
 st.title("📦 Retail Inventory Agent")
 st.write(
-    "Dashboard untuk memantau persediaan, mengidentifikasi risiko "
-    "kekurangan stok, dan mengevaluasi kemungkinan kelebihan stok."
+    "Dashboard untuk memantau persediaan, memprediksi demand, "
+    "dan memberikan rekomendasi pemesanan produk."
 )
 
-# =========================
-# KONFIGURASI BATAS RISIKO
-# =========================
+# Batas awal klasifikasi risiko stok
 BATAS_STOK_RENDAH = 0.5
 BATAS_STOK_PANTAU = 1.0
 BATAS_STOK_AMAN = 1.5
 
 
-# =========================
-# MEMUAT DAN MEMBERSIHKAN DATA
-# =========================
+# ==================================================
+# 2. MEMUAT DAN MEMBERSIHKAN DATA
+# ==================================================
 @st.cache_data
 def load_data():
     df = pd.read_excel("sales_data.xlsx")
 
-    # Membersihkan nama kolom
     df.columns = df.columns.str.strip()
 
-    # Memastikan kolom wajib tersedia
     required_columns = [
         "Date",
         "Store ID",
@@ -44,8 +41,6 @@ def load_data():
         "Category",
         "Region",
         "Inventory Level",
-        "Units Sold",
-        "Units Ordered",
         "Demand"
     ]
 
@@ -56,24 +51,27 @@ def load_data():
 
     if missing_columns:
         raise ValueError(
-            "Kolom berikut tidak ditemukan: "
+            "Kolom tidak ditemukan: "
             + ", ".join(missing_columns)
         )
 
-    # Membersihkan tipe data
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["Date"] = pd.to_datetime(
+        df["Date"], errors="coerce"
+    )
 
     numeric_columns = [
         "Inventory Level",
+        "Demand",
         "Units Sold",
-        "Units Ordered",
-        "Demand"
+        "Units Ordered"
     ]
 
     for col in numeric_columns:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        if col in df.columns:
+            df[col] = pd.to_numeric(
+                df[col], errors="coerce"
+            )
 
-    # Menghapus baris dengan data utama yang tidak valid
     df = df.dropna(
         subset=[
             "Date",
@@ -84,25 +82,23 @@ def load_data():
         ]
     ).copy()
 
-    # Nilai negatif tidak digunakan dalam analisis stok
     df = df[
         (df["Inventory Level"] >= 0)
         & (df["Demand"] >= 0)
     ].copy()
 
     if df.empty:
-        raise ValueError(
-            "Tidak ada data valid yang dapat dianalisis."
-        )
+        raise ValueError("Tidak ada data valid untuk dianalisis.")
 
-    # Menghitung rasio persediaan terhadap demand
+    # ----------------------------------------------
+    # Rasio stok terhadap demand
+    # ----------------------------------------------
     df["Stock Ratio"] = np.where(
         df["Demand"] > 0,
         df["Inventory Level"] / df["Demand"],
         np.nan
     )
 
-    # Mengelompokkan risiko persediaan
     def evaluasi_stok(ratio):
         if pd.isna(ratio):
             return "Demand nol"
@@ -119,12 +115,10 @@ def load_data():
         evaluasi_stok
     )
 
-    # =========================
-    # MENGHITUNG TREN DEMAND
-    # =========================
-    # Membandingkan rata-rata 7 data terakhir dengan
-    # 7 data sebelumnya untuk setiap kombinasi toko-produk.
-
+    # ----------------------------------------------
+    # Tren demand: 7 data terakhir dibanding 7 data
+    # sebelumnya untuk setiap toko dan produk
+    # ----------------------------------------------
     trend_rows = []
 
     for (store_id, product_id), group in df.groupby(
@@ -138,7 +132,7 @@ def load_data():
         if pd.isna(previous) or previous == 0:
             trend = np.nan
         else:
-            trend = ((recent - previous) / previous) * 100
+            trend = (recent - previous) / previous * 100
 
         trend_rows.append({
             "Store ID": store_id,
@@ -159,39 +153,83 @@ def load_data():
     return df
 
 
-# =========================
-# MENAMPILKAN DATA
-# =========================
+# ==================================================
+# 3. PREDIKSI DEMAND PER PRODUK DAN TOKO
+# ==================================================
+def hitung_prediksi(group):
+    """
+    Weighted Moving Average:
+    data paling baru mendapat bobot paling besar.
+    Menggunakan maksimal 7 data terakhir.
+    """
+    group = group.sort_values("Date")
+    recent = group["Demand"].tail(7).to_numpy()
+
+    if len(recent) == 0:
+        return np.nan
+
+    weights = np.arange(1, len(recent) + 1)
+
+    forecast = np.average(
+        recent,
+        weights=weights
+    )
+
+    return max(0, float(forecast))
+
+
+def buat_tabel_prediksi(data):
+    rows = []
+
+    for (store_id, product_id), group in data.groupby(
+        ["Store ID", "Product ID"]
+    ):
+        group = group.sort_values("Date")
+
+        latest_row = group.iloc[-1]
+        daily_forecast = hitung_prediksi(group)
+
+        rows.append({
+            "Store ID": store_id,
+            "Product ID": product_id,
+            "Category": latest_row["Category"],
+            "Region": latest_row["Region"],
+            "Tanggal Data Terakhir": latest_row["Date"],
+            "Inventory Level": latest_row["Inventory Level"],
+            "Demand Aktual Terakhir": latest_row["Demand"],
+            "Prediksi Demand Harian": daily_forecast
+        })
+
+    return pd.DataFrame(rows)
+
+
+# ==================================================
+# 4. MEMUAT APLIKASI
+# ==================================================
 try:
     data = load_data()
 
 except Exception as e:
     st.error(f"Gagal memuat aplikasi: {e}")
     st.info(
-        "Pastikan sales_data.xlsx berada di repository yang sama "
-        "dengan app.py dan requirements.txt sudah benar."
+        "Pastikan sales_data.xlsx tersedia di repository "
+        "dan requirements.txt berisi streamlit, pandas, "
+        "openpyxl, dan numpy."
     )
     st.stop()
 
 
-# =========================
-# INFORMASI DATA TERBARU
-# =========================
 latest_date = data["Date"].max()
 
-latest_data = data[
-    data["Date"] == latest_date
-].copy()
-
 st.caption(
-    f"Analisis menggunakan data terbaru: "
-    f"{latest_date.strftime('%d %B %Y')}. "
-    "Batas rasio merupakan aturan awal yang perlu divalidasi."
+    f"Data terbaru: {latest_date.strftime('%d %B %Y')}. "
+    "Prediksi menggunakan Weighted Moving Average."
 )
 
-# =========================
-# SIDEBAR FILTER
-# =========================
+
+# ==================================================
+# 5. SIDEBAR: FILTER DAN PARAMETER
+# ==================================================
 st.sidebar.header("🔎 Filter Data")
 
 regions = sorted(
@@ -211,47 +249,144 @@ stores = sorted(
 
 selected_regions = st.sidebar.multiselect(
     "Pilih Region",
-    options=regions,
+    regions,
     default=regions
 )
 
 selected_categories = st.sidebar.multiselect(
-    "Pilih Kategori Produk",
-    options=categories,
+    "Pilih Kategori",
+    categories,
     default=categories
 )
 
 selected_stores = st.sidebar.multiselect(
     "Pilih Store ID",
-    options=stores,
+    stores,
     default=stores
 )
 
-# Filter snapshot tanggal terbaru
-filtered = latest_data[
-    latest_data["Region"].isin(selected_regions)
-    & latest_data["Category"].isin(selected_categories)
-    & latest_data["Store ID"].isin(selected_stores)
-].copy()
+st.sidebar.divider()
+st.sidebar.header("⚙️ Parameter Perencanaan Stok")
 
-# Filter seluruh data untuk analisis tren
+forecast_horizon = st.sidebar.slider(
+    "Horizon Prediksi (hari)",
+    min_value=1,
+    max_value=30,
+    value=7
+)
+
+lead_time = st.sidebar.number_input(
+    "Lead Time Pemasok (hari)",
+    min_value=0,
+    max_value=90,
+    value=3,
+    step=1,
+    help="Perkiraan waktu sejak pemesanan hingga stok diterima."
+)
+
+safety_days = st.sidebar.number_input(
+    "Stok Pengaman (hari kebutuhan)",
+    min_value=0,
+    max_value=30,
+    value=2,
+    step=1,
+    help="Tambahan persediaan untuk mengantisipasi ketidakpastian."
+)
+
+st.sidebar.caption(
+    "Lead time dan stok pengaman adalah parameter asumsi "
+    "yang dapat disesuaikan."
+)
+
+
+# ==================================================
+# 6. FILTER DATA
+# ==================================================
 filtered_history = data[
     data["Region"].isin(selected_regions)
     & data["Category"].isin(selected_categories)
     & data["Store ID"].isin(selected_stores)
 ].copy()
 
-if filtered.empty:
+if filtered_history.empty:
     st.warning(
-        "Tidak ada data untuk kombinasi filter yang dipilih. "
+        "Tidak ada data untuk filter yang dipilih. "
         "Silakan ubah filter di sidebar."
     )
     st.stop()
 
+# Snapshot data terbaru secara global
+filtered = filtered_history[
+    filtered_history["Date"] == latest_date
+].copy()
 
-# =========================
-# RINGKASAN DASHBOARD
-# =========================
+if filtered.empty:
+    st.warning("Data terbaru tidak tersedia untuk filter ini.")
+    st.stop()
+
+
+# ==================================================
+# 7. MEMBUAT PREDIKSI DAN REKOMENDASI PEMESANAN
+# ==================================================
+forecast_table = buat_tabel_prediksi(filtered_history)
+
+# Total kebutuhan selama horizon prediksi
+forecast_table["Prediksi Total Demand"] = (
+    forecast_table["Prediksi Demand Harian"]
+    * forecast_horizon
+)
+
+# Kebutuhan untuk lead time + stok pengaman
+forecast_table["Target Stok"] = (
+    forecast_table["Prediksi Demand Harian"]
+    * (lead_time + safety_days)
+)
+
+# Jumlah stok yang disarankan untuk dipesan
+forecast_table["Rekomendasi Pesan"] = (
+    forecast_table["Target Stok"]
+    - forecast_table["Inventory Level"]
+).clip(lower=0).apply(math.ceil)
+
+forecast_table["Status Pemesanan"] = np.where(
+    forecast_table["Rekomendasi Pesan"] > 0,
+    "Perlu pemesanan",
+    "Stok mencukupi"
+)
+
+# Menggabungkan hasil prediksi dengan snapshot
+filtered = filtered.drop(
+    columns=[
+        "Prediksi Demand Harian",
+        "Prediksi Total Demand",
+        "Target Stok",
+        "Rekomendasi Pesan",
+        "Status Pemesanan"
+    ],
+    errors="ignore"
+)
+
+filtered = filtered.merge(
+    forecast_table[
+        [
+            "Store ID",
+            "Product ID",
+            "Prediksi Demand Harian",
+            "Prediksi Total Demand",
+            "Target Stok",
+            "Rekomendasi Pesan",
+            "Status Pemesanan"
+        ]
+    ],
+    on=["Store ID", "Product ID"],
+    how="left",
+    validate="one_to_one"
+)
+
+
+# ==================================================
+# 8. RINGKASAN DASHBOARD
+# ==================================================
 st.subheader("📊 Ringkasan Persediaan Terbaru")
 
 total_produk_toko = len(filtered)
@@ -264,12 +399,12 @@ perlu_dipantau = (
     filtered["Evaluasi Stok"] == "Perlu dipantau"
 ).sum()
 
-stok_aman = (
-    filtered["Evaluasi Stok"] == "Stok relatif aman"
-).sum()
-
 stok_berlebih = (
     filtered["Evaluasi Stok"] == "Evaluasi stok berlebih"
+).sum()
+
+produk_perlu_pesan = (
+    filtered["Rekomendasi Pesan"] > 0
 ).sum()
 
 col1, col2, col3, col4 = st.columns(4)
@@ -285,21 +420,21 @@ col2.metric(
 )
 
 col3.metric(
-    "Perlu Dipantau",
-    f"{perlu_dipantau:,}"
+    "Potensi Stok Berlebih",
+    f"{stok_berlebih:,}"
 )
 
 col4.metric(
-    "Evaluasi Stok Berlebih",
-    f"{stok_berlebih:,}"
+    "Produk Perlu Dipesan",
+    f"{produk_perlu_pesan:,}"
 )
 
 st.divider()
 
 
-# =========================
-# DISTRIBUSI RISIKO
-# =========================
+# ==================================================
+# 9. DISTRIBUSI STATUS STOK
+# ==================================================
 st.subheader("📈 Distribusi Status Persediaan")
 
 risk_order = [
@@ -316,26 +451,228 @@ risk_counts = (
     .reindex(risk_order, fill_value=0)
 )
 
-risk_chart = risk_counts[
-    risk_counts > 0
-].rename_axis("Status").reset_index(name="Jumlah")
+risk_counts = risk_counts[risk_counts > 0]
 
-if not risk_chart.empty:
-    st.bar_chart(
-        risk_chart.set_index("Status")["Jumlah"]
-    )
+if not risk_counts.empty:
+    st.bar_chart(risk_counts)
 
 st.caption(
-    "Klasifikasi ini menggunakan rasio Inventory Level terhadap "
-    "Demand, bukan hasil prediksi stok habis yang telah divalidasi."
+    "Status stok menggunakan rasio Inventory Level terhadap "
+    "Demand pada data terakhir."
 )
 
 st.divider()
 
 
-# =========================
-# ANALISIS RISIKO KEKURANGAN STOK
-# =========================
+# ==================================================
+# 10. FITUR BARU: PREDIKSI DEMAND
+# ==================================================
+st.subheader("🔮 Prediksi Demand")
+
+st.write(
+    f"Prediksi kebutuhan untuk **{forecast_horizon} hari ke depan** "
+    "berdasarkan Weighted Moving Average dari maksimal 7 data terakhir."
+)
+
+forecast_display = forecast_table.copy()
+
+forecast_display["Prediksi Demand Harian"] = (
+    forecast_display["Prediksi Demand Harian"].round(2)
+)
+
+forecast_display["Prediksi Total Demand"] = (
+    forecast_display["Prediksi Total Demand"].round(2)
+)
+
+forecast_columns = [
+    "Store ID",
+    "Product ID",
+    "Category",
+    "Region",
+    "Demand Aktual Terakhir",
+    "Prediksi Demand Harian",
+    "Prediksi Total Demand"
+]
+
+st.dataframe(
+    forecast_display[forecast_columns].sort_values(
+        by=["Store ID", "Product ID"],
+        key=lambda col: col.astype(str)
+    ),
+    use_container_width=True,
+    hide_index=True
+)
+
+st.caption(
+    "Prediksi total demand dihitung dari prediksi demand harian "
+    "dikalikan jumlah hari pada horizon. Ini merupakan estimasi "
+    "baseline, bukan jaminan kebutuhan aktual."
+)
+
+# Grafik prediksi satu produk pada satu toko
+st.markdown("#### Grafik Prediksi per Produk dan Toko")
+
+product_options = sorted(
+    forecast_table["Product ID"].dropna().unique().tolist(),
+    key=str
+)
+
+if product_options:
+    selected_product = st.selectbox(
+        "Pilih Product ID",
+        product_options,
+        key="forecast_product"
+    )
+
+    store_options = sorted(
+        forecast_table.loc[
+            forecast_table["Product ID"] == selected_product,
+            "Store ID"
+        ].dropna().unique().tolist(),
+        key=str
+    )
+
+    if store_options:
+        selected_store = st.selectbox(
+            "Pilih Store ID untuk grafik",
+            store_options,
+            key="forecast_store"
+        )
+
+        history_chart = filtered_history[
+            (filtered_history["Product ID"] == selected_product)
+            & (filtered_history["Store ID"] == selected_store)
+        ].sort_values("Date").tail(30)
+
+        actual_chart = history_chart[
+            ["Date", "Demand"]
+        ].rename(columns={"Demand": "Demand Aktual"})
+
+        actual_chart = actual_chart.set_index("Date")
+
+        daily_prediction = forecast_table[
+            (forecast_table["Product ID"] == selected_product)
+            & (forecast_table["Store ID"] == selected_store)
+        ]["Prediksi Demand Harian"]
+
+        if not daily_prediction.empty:
+            daily_prediction = float(daily_prediction.iloc[0])
+
+            future_dates = pd.date_range(
+                start=latest_date + pd.Timedelta(days=1),
+                periods=forecast_horizon,
+                freq="D"
+            )
+
+            future_chart = pd.DataFrame({
+                "Tanggal": future_dates,
+                "Prediksi Demand": [
+                    daily_prediction
+                ] * forecast_horizon
+            }).set_index("Tanggal")
+
+            st.write("Demand aktual — maksimal 30 data terakhir")
+            st.line_chart(actual_chart)
+
+            st.write("Prediksi demand untuk periode mendatang")
+            st.line_chart(future_chart)
+
+st.divider()
+
+
+# ==================================================
+# 11. FITUR BARU: REKOMENDASI PEMESANAN
+# ==================================================
+st.subheader("🛒 Rekomendasi Pemesanan Otomatis")
+
+st.write(
+    "Sistem menghitung estimasi jumlah pemesanan agar persediaan "
+    "mencukupi kebutuhan selama lead time ditambah stok pengaman."
+)
+
+st.markdown(
+    """
+    **Logika perhitungan**
+
+    - Target stok = prediksi demand harian × (lead time + stok pengaman)
+    - Rekomendasi pesan = maksimum dari 0 dan (target stok − stok saat ini)
+    - Jumlah pemesanan dibulatkan ke atas menjadi bilangan bulat.
+    """
+)
+
+order_data = forecast_table[
+    forecast_table["Rekomendasi Pesan"] > 0
+].copy()
+
+if order_data.empty:
+    st.success(
+        "Tidak ada produk yang perlu dipesan berdasarkan parameter "
+        "dan data yang sedang dipilih."
+    )
+else:
+    order_data = order_data.sort_values(
+        by="Rekomendasi Pesan",
+        ascending=False
+    )
+
+    order_columns = [
+        "Store ID",
+        "Product ID",
+        "Category",
+        "Region",
+        "Inventory Level",
+        "Prediksi Demand Harian",
+        "Target Stok",
+        "Rekomendasi Pesan",
+        "Status Pemesanan"
+    ]
+
+    order_display = order_data[order_columns].copy()
+
+    order_display["Prediksi Demand Harian"] = (
+        order_display["Prediksi Demand Harian"].round(2)
+    )
+
+    order_display["Target Stok"] = (
+        order_display["Target Stok"].round(2)
+    )
+
+    st.dataframe(
+        order_display,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    total_recommended_units = int(
+        order_data["Rekomendasi Pesan"].sum()
+    )
+
+    st.metric(
+        "Total Unit yang Disarankan untuk Dipesan",
+        f"{total_recommended_units:,}"
+    )
+
+    st.write("**Rekomendasi tindakan:**")
+    st.write(
+        "- Prioritaskan produk dengan jumlah pemesanan tertinggi."
+    )
+    st.write(
+        "- Periksa stok fisik dan pesanan yang sedang dalam perjalanan."
+    )
+    st.write(
+        "- Konfirmasikan lead time dan jumlah pesanan minimum pemasok."
+    )
+    st.write(
+        "- Sesuaikan jumlah akhir berdasarkan kapasitas penyimpanan "
+        "dan kebijakan pemesanan."
+    )
+
+st.divider()
+
+
+# ==================================================
+# 12. RISIKO KEKURANGAN STOK
+# ==================================================
 st.subheader("🚨 Risiko Kekurangan Stok")
 
 shortage_data = filtered[
@@ -354,7 +691,7 @@ shortage_data = shortage_data.sort_values(
 if shortage_data.empty:
     st.success(
         "Tidak ditemukan produk dengan status prioritas tinggi "
-        "atau perlu dipantau pada filter saat ini."
+        "atau perlu dipantau."
     )
 else:
     shortage_columns = [
@@ -375,24 +712,16 @@ else:
     )
 
     st.write("**Rekomendasi awal:**")
-
-    st.write(
-        "- Periksa produk berstatus Prioritas Tinggi terlebih dahulu."
-    )
-    st.write(
-        "- Tinjau kebutuhan pemesanan berdasarkan demand dan "
-        "lead time pemasok."
-    )
-    st.write(
-        "- Periksa kembali data stok fisik sebelum melakukan pemesanan."
-    )
+    st.write("- Periksa produk dengan rasio stok paling rendah.")
+    st.write("- Bandingkan hasil risiko dengan rekomendasi pemesanan.")
+    st.write("- Pastikan data stok dan demand sudah benar.")
 
 st.divider()
 
 
-# =========================
-# ANALISIS POTENSI STOK BERLEBIH
-# =========================
+# ==================================================
+# 13. POTENSI STOK BERLEBIH
+# ==================================================
 st.subheader("📦 Potensi Stok Berlebih")
 
 excess_data = filtered[
@@ -408,7 +737,7 @@ excess_data = excess_data.sort_values(
 if excess_data.empty:
     st.info(
         "Tidak ditemukan produk dengan rasio stok di atas "
-        "batas evaluasi pada filter saat ini."
+        "batas evaluasi."
     )
 else:
     excess_columns = [
@@ -429,67 +758,50 @@ else:
     )
 
     st.write("**Rekomendasi awal:**")
-
-    st.write(
-        "- Periksa apakah persediaan sesuai dengan kebutuhan penjualan."
-    )
-    st.write(
-        "- Pertimbangkan pemindahan stok ke toko lain jika dibutuhkan."
-    )
-    st.write(
-        "- Evaluasi kembali jumlah pemesanan periode berikutnya."
-    )
+    st.write("- Evaluasi kembali kebutuhan pemesanan produk.")
+    st.write("- Periksa kemungkinan pemindahan stok antar-toko.")
+    st.write("- Pastikan produk tidak mengalami perubahan pola demand.")
 
 st.divider()
 
 
-# =========================
-# ANALISIS TREN DEMAND
-# =========================
-st.subheader("📉 Analisis Tren Demand")
+# ==================================================
+# 14. TREN DEMAND HISTORIS
+# ==================================================
+st.subheader("📉 Tren Demand Historis")
 
-products = sorted(
+history_products = sorted(
     filtered_history["Product ID"].dropna().unique().tolist(),
     key=str
 )
 
-if products:
-    selected_product = st.selectbox(
-        "Pilih Product ID untuk melihat tren",
-        options=products
+if history_products:
+    selected_history_product = st.selectbox(
+        "Pilih produk untuk melihat tren historis",
+        history_products,
+        key="history_product"
     )
 
     product_history = filtered_history[
-        filtered_history["Product ID"] == selected_product
+        filtered_history["Product ID"] == selected_history_product
     ].copy()
 
     product_history = (
         product_history.groupby("Date", as_index=False)
-        .agg({
-            "Demand": "mean",
-            "Units Sold": "mean"
-        })
+        .agg({"Demand": "mean"})
         .sort_values("Date")
     )
 
     st.line_chart(
-        product_history.set_index("Date")[[
-            "Demand",
-            "Units Sold"
-        ]]
-    )
-
-    st.caption(
-        "Grafik menampilkan rata-rata Demand dan Units Sold "
-        "produk yang dipilih pada toko-toko dalam filter."
+        product_history.set_index("Date")["Demand"]
     )
 
 st.divider()
 
 
-# =========================
-# RINGKASAN TREN PER PRODUK-TOKO
-# =========================
+# ==================================================
+# 15. TREN PER PRODUK DAN TOKO
+# ==================================================
 st.subheader("📌 Perubahan Demand per Produk dan Toko")
 
 trend_latest = filtered[
@@ -516,18 +828,17 @@ st.dataframe(
 )
 
 st.caption(
-    "Perubahan demand dihitung dengan membandingkan rata-rata "
-    "7 data terakhir dan 7 data sebelumnya pada setiap produk-toko. "
-    "Jika data sebelumnya tidak tersedia atau bernilai nol, "
-    "perubahan ditampilkan sebagai nilai kosong."
+    "Perubahan demand membandingkan rata-rata 7 data terakhir "
+    "dengan 7 data sebelumnya. Jika data sebelumnya tidak tersedia "
+    "atau bernilai nol, perubahan ditampilkan kosong."
 )
 
 st.divider()
 
 
-# =========================
-# TABEL DATA LENGKAP
-# =========================
+# ==================================================
+# 16. TABEL DETAIL DAN DOWNLOAD
+# ==================================================
 st.subheader("📋 Detail Persediaan Terbaru")
 
 detail_columns = [
@@ -543,10 +854,14 @@ detail_columns = [
     "Stock Ratio",
     "Evaluasi Stok",
     "Rata-rata Demand 7 Hari",
-    "Perubahan Demand (%)"
+    "Perubahan Demand (%)",
+    "Prediksi Demand Harian",
+    "Prediksi Total Demand",
+    "Target Stok",
+    "Rekomendasi Pesan",
+    "Status Pemesanan"
 ]
 
-# Hanya tampilkan kolom yang tersedia
 detail_columns = [
     col for col in detail_columns
     if col in filtered.columns
@@ -561,10 +876,6 @@ st.dataframe(
     hide_index=True
 )
 
-
-# =========================
-# DOWNLOAD HASIL ANALISIS
-# =========================
 st.subheader("⬇️ Unduh Hasil Analisis")
 
 csv_data = filtered[detail_columns].to_csv(
@@ -574,12 +885,13 @@ csv_data = filtered[detail_columns].to_csv(
 st.download_button(
     label="Download Analisis Persediaan (CSV)",
     data=csv_data,
-    file_name="analisis_persediaan.csv",
+    file_name="retail_inventory_analysis.csv",
     mime="text/csv"
 )
 
 st.caption(
-    "Catatan: batas rasio stok pada dashboard ini adalah asumsi awal. "
-    "Untuk keputusan operasional, validasi definisi Demand, periode "
-    "data, lead time pemasok, dan stok pengaman terlebih dahulu."
+    "Catatan: prediksi menggunakan Weighted Moving Average sederhana. "
+    "Kualitas hasil bergantung pada data historis. Rekomendasi pemesanan "
+    "belum memperhitungkan pesanan yang sedang berjalan, minimum order "
+    "quantity, kapasitas penyimpanan, atau biaya persediaan."
 )
