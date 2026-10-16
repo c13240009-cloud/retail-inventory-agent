@@ -3,51 +3,135 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
+# =========================
+# KONFIGURASI HALAMAN
+# =========================
 st.set_page_config(
     page_title="Retail Inventory Agent",
     page_icon="📦",
     layout="wide"
 )
 
+st.title("📦 Retail Inventory Agent")
+st.write(
+    "Dashboard untuk memantau persediaan, mengidentifikasi risiko "
+    "kekurangan stok, dan mengevaluasi kemungkinan kelebihan stok."
+)
 
+# =========================
+# KONFIGURASI BATAS RISIKO
+# =========================
+BATAS_STOK_RENDAH = 0.5
+BATAS_STOK_PANTAU = 1.0
+BATAS_STOK_AMAN = 1.5
+
+
+# =========================
+# MEMUAT DAN MEMBERSIHKAN DATA
+# =========================
 @st.cache_data
 def load_data():
-    data = pd.read_excel("sales_data.xlsx")
-    data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
+    df = pd.read_excel("sales_data.xlsx")
 
-    numeric_cols = [
-        "Inventory Level", "Demand", "Units Sold", "Units Ordered"
+    # Membersihkan nama kolom
+    df.columns = df.columns.str.strip()
+
+    # Memastikan kolom wajib tersedia
+    required_columns = [
+        "Date",
+        "Store ID",
+        "Product ID",
+        "Category",
+        "Region",
+        "Inventory Level",
+        "Units Sold",
+        "Units Ordered",
+        "Demand"
     ]
-    for col in numeric_cols:
-        data[col] = pd.to_numeric(data[col], errors="coerce")
 
-    data = data.dropna(
-        subset=["Date", "Store ID", "Product ID", "Inventory Level", "Demand"]
+    missing_columns = [
+        col for col in required_columns
+        if col not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "Kolom berikut tidak ditemukan: "
+            + ", ".join(missing_columns)
+        )
+
+    # Membersihkan tipe data
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+
+    numeric_columns = [
+        "Inventory Level",
+        "Units Sold",
+        "Units Ordered",
+        "Demand"
+    ]
+
+    for col in numeric_columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Menghapus baris dengan data utama yang tidak valid
+    df = df.dropna(
+        subset=[
+            "Date",
+            "Store ID",
+            "Product ID",
+            "Inventory Level",
+            "Demand"
+        ]
+    ).copy()
+
+    # Nilai negatif tidak digunakan dalam analisis stok
+    df = df[
+        (df["Inventory Level"] >= 0)
+        & (df["Demand"] >= 0)
+    ].copy()
+
+    if df.empty:
+        raise ValueError(
+            "Tidak ada data valid yang dapat dianalisis."
+        )
+
+    # Menghitung rasio persediaan terhadap demand
+    df["Stock Ratio"] = np.where(
+        df["Demand"] > 0,
+        df["Inventory Level"] / df["Demand"],
+        np.nan
     )
 
-    data["Stock Ratio"] = (
-        data["Inventory Level"]
-        / data["Demand"].replace(0, np.nan)
-    )
-
-    def evaluate(ratio):
+    # Mengelompokkan risiko persediaan
+    def evaluasi_stok(ratio):
         if pd.isna(ratio):
-            return "Demand tidak valid"
-        elif ratio <= 0.5:
+            return "Demand nol"
+        elif ratio <= BATAS_STOK_RENDAH:
             return "Prioritas tinggi"
-        elif ratio <= 1.0:
+        elif ratio <= BATAS_STOK_PANTAU:
             return "Perlu dipantau"
-        elif ratio <= 1.5:
+        elif ratio <= BATAS_STOK_AMAN:
             return "Stok relatif aman"
-        return "Evaluasi stok berlebih"
+        else:
+            return "Evaluasi stok berlebih"
 
-    data["Evaluasi Stok"] = data["Stock Ratio"].apply(evaluate)
+    df["Evaluasi Stok"] = df["Stock Ratio"].apply(
+        evaluasi_stok
+    )
 
-    data = data.sort_values("Date")
+    # =========================
+    # MENGHITUNG TREN DEMAND
+    # =========================
+    # Membandingkan rata-rata 7 data terakhir dengan
+    # 7 data sebelumnya untuk setiap kombinasi toko-produk.
 
-    # Bandingkan rata-rata Demand 7 hari terakhir dengan 7 hari sebelumnya
-    def calculate_trend(group):
-        group = group.sort_values("Date").copy()
+    trend_rows = []
+
+    for (store_id, product_id), group in df.groupby(
+        ["Store ID", "Product ID"]
+    ):
+        group = group.sort_values("Date")
+
         recent = group["Demand"].tail(7).mean()
         previous = group["Demand"].iloc[-14:-7].mean()
 
@@ -56,259 +140,446 @@ def load_data():
         else:
             trend = ((recent - previous) / previous) * 100
 
-        group["Rata-rata Demand 7 Hari"] = recent
-        group["Perubahan Demand (%)"] = trend
-        return group
+        trend_rows.append({
+            "Store ID": store_id,
+            "Product ID": product_id,
+            "Rata-rata Demand 7 Hari": recent,
+            "Perubahan Demand (%)": trend
+        })
 
-    data = (
-        data.groupby(["Store ID", "Product ID"], group_keys=False)
-        .apply(calculate_trend)
-        .reset_index(drop=True)
+    trend_df = pd.DataFrame(trend_rows)
+
+    df = df.merge(
+        trend_df,
+        on=["Store ID", "Product ID"],
+        how="left",
+        validate="many_to_one"
     )
 
-    return data
+    return df
 
 
-def recommendation(row):
-    ratio = row["Stock Ratio"]
-    trend = row["Perubahan Demand (%)"]
-
-    if pd.isna(ratio):
-        return "Periksa data Demand terlebih dahulu."
-
-    if ratio <= 0.5:
-        action = (
-            "Prioritaskan pemeriksaan ketersediaan stok "
-            "dan kebutuhan pengisian ulang."
-        )
-    elif ratio <= 1.0:
-        action = (
-            "Pantau persediaan dan periksa perubahan permintaan."
-        )
-    elif ratio <= 1.5:
-        action = (
-            "Pantau kondisi stok secara berkala."
-        )
-    else:
-        action = (
-            "Evaluasi potensi stok berlebih sebelum melakukan "
-            "pemesanan berikutnya."
-        )
-
-    if pd.notna(trend):
-        if trend >= 10:
-            action += " Demand naik dibandingkan 7 hari sebelumnya."
-        elif trend <= -10:
-            action += " Demand turun dibandingkan 7 hari sebelumnya."
-
-    return action
-
-
+# =========================
+# MENAMPILKAN DATA
+# =========================
 try:
-    df = load_data()
-
-    st.title("📦 Retail Inventory Agent")
-    st.caption(
-        "Analisis risiko persediaan, tren permintaan, "
-        "dan rekomendasi pemeriksaan stok"
-    )
-
-    latest_date = df["Date"].max()
-    snapshot = df[df["Date"] == latest_date].copy()
-
-    st.info(
-        f"Analisis risiko menggunakan data terbaru: "
-        f"{latest_date:%d %B %Y}. "
-        "Batas rasio merupakan aturan awal yang perlu divalidasi."
-    )
-
-    # Filter
-    st.sidebar.header("Filter Data")
-
-    regions = sorted(snapshot["Region"].dropna().unique())
-    categories = sorted(snapshot["Category"].dropna().unique())
-    stores = sorted(snapshot["Store ID"].dropna().unique())
-
-    selected_regions = st.sidebar.multiselect(
-        "Pilih Region", regions, default=regions
-    )
-    selected_categories = st.sidebar.multiselect(
-        "Pilih Category", categories, default=categories
-    )
-    selected_stores = st.sidebar.multiselect(
-        "Pilih Store ID", stores, default=stores
-    )
-
-    filtered = snapshot[
-        snapshot["Region"].isin(selected_regions)
-        & snapshot["Category"].isin(selected_categories)
-        & snapshot["Store ID"].isin(selected_stores)
-    ].copy()
-
-    if filtered.empty:
-        st.warning("Tidak ada data untuk kombinasi filter tersebut.")
-        st.stop()
-
-    # Metrik utama
-    st.subheader("Ringkasan Risiko Persediaan")
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric("Produk-Toko Dianalisis", f"{len(filtered):,}")
-    c2.metric(
-        "Prioritas Tinggi",
-        int((filtered["Evaluasi Stok"] == "Prioritas tinggi").sum())
-    )
-    c3.metric(
-        "Perlu Dipantau",
-        int((filtered["Evaluasi Stok"] == "Perlu dipantau").sum())
-    )
-    c4.metric(
-        "Potensi Stok Berlebih",
-        int(
-            (filtered["Evaluasi Stok"] == "Evaluasi stok berlebih").sum()
-        )
-    )
-
-    # Distribusi risiko
-    st.subheader("Distribusi Evaluasi Stok")
-
-    order = [
-        "Prioritas tinggi",
-        "Perlu dipantau",
-        "Stok relatif aman",
-        "Evaluasi stok berlebih",
-        "Demand tidak valid"
-    ]
-
-    counts = (
-        filtered["Evaluasi Stok"]
-        .value_counts()
-        .reindex(order, fill_value=0)
-    )
-
-    st.bar_chart(counts, horizontal=True)
-
-    # Analisis produk berisiko
-    st.subheader("Produk dengan Risiko Kekurangan Stok")
-
-    shortage = filtered[
-        filtered["Evaluasi Stok"].isin(
-            ["Prioritas tinggi", "Perlu dipantau"]
-        )
-    ].sort_values("Stock Ratio", ascending=True).head(10).copy()
-
-    if shortage.empty:
-        st.success("Tidak ada produk dalam kategori risiko awal ini.")
-    else:
-        shortage["Rekomendasi"] = shortage.apply(recommendation, axis=1)
-        st.dataframe(
-            shortage[
-                [
-                    "Store ID", "Product ID", "Category", "Region",
-                    "Inventory Level", "Demand", "Stock Ratio",
-                    "Perubahan Demand (%)", "Evaluasi Stok", "Rekomendasi"
-                ]
-            ].round(2),
-            use_container_width=True,
-            hide_index=True
-        )
-
-    st.subheader("Produk dengan Potensi Stok Berlebih")
-
-    excess = filtered[
-        filtered["Evaluasi Stok"] == "Evaluasi stok berlebih"
-    ].sort_values("Stock Ratio", ascending=False).head(10).copy()
-
-    if excess.empty:
-        st.success("Tidak ada produk dalam kategori ini.")
-    else:
-        excess["Rekomendasi"] = excess.apply(recommendation, axis=1)
-        st.dataframe(
-            excess[
-                [
-                    "Store ID", "Product ID", "Category", "Region",
-                    "Inventory Level", "Demand", "Stock Ratio",
-                    "Perubahan Demand (%)", "Evaluasi Stok", "Rekomendasi"
-                ]
-            ].round(2),
-            use_container_width=True,
-            hide_index=True
-        )
-
-    # Tren permintaan
-    st.subheader("Tren Permintaan")
-
-    trend_data = (
-        df[df["Date"] <= latest_date]
-        .sort_values("Date")
-        .tail(14)
-    )
-
-    trend_options = sorted(trend_data["Product ID"].unique())
-    selected_product = st.selectbox(
-        "Pilih produk untuk melihat tren Demand",
-        trend_options
-    )
-
-    product_trend = (
-        df[
-            (df["Product ID"] == selected_product)
-            & (df["Date"] <= latest_date)
-        ]
-        .groupby("Date", as_index=False)["Demand"]
-        .mean()
-        .sort_values("Date")
-        .tail(30)
-    )
-
-    st.line_chart(
-        product_trend.set_index("Date")["Demand"],
-        x_label="Tanggal",
-        y_label="Rata-rata Demand"
-    )
-
-    # Tabel lengkap dan ekspor
-    st.subheader("Data Persediaan yang Dianalisis")
-
-    search = st.text_input("Cari Store ID atau Product ID")
-
-    display_data = filtered.copy()
-
-    if search:
-        mask = (
-            display_data["Store ID"].astype(str).str.contains(
-                search, case=False, na=False
-            )
-            | display_data["Product ID"].astype(str).str.contains(
-                search, case=False, na=False
-            )
-        )
-        display_data = display_data[mask]
-
-    display_data["Rekomendasi"] = display_data.apply(
-        recommendation, axis=1
-    )
-
-    st.dataframe(display_data, use_container_width=True, hide_index=True)
-
-    st.download_button(
-        "Download Hasil Analisis CSV",
-        data=display_data.to_csv(index=False).encode("utf-8-sig"),
-        file_name="hasil_analisis_inventory.csv",
-        mime="text/csv"
-    )
-
-    st.caption(
-        "Catatan: rasio Inventory Level / Demand dan batas kategorinya "
-        "adalah indikator heuristik. Validasi arti dan periode Demand, "
-        "lead time, serta kebijakan stok sebelum menggunakan hasil "
-        "untuk keputusan pemesanan nyata."
-    )
+    data = load_data()
 
 except Exception as e:
     st.error(f"Gagal memuat aplikasi: {e}")
     st.info(
-        "Pastikan sales_data.xlsx tersedia di repository dan "
-        "requirements.txt memuat streamlit, pandas, openpyxl, dan numpy."
+        "Pastikan sales_data.xlsx berada di repository yang sama "
+        "dengan app.py dan requirements.txt sudah benar."
     )
+    st.stop()
+
+
+# =========================
+# INFORMASI DATA TERBARU
+# =========================
+latest_date = data["Date"].max()
+
+latest_data = data[
+    data["Date"] == latest_date
+].copy()
+
+st.caption(
+    f"Analisis menggunakan data terbaru: "
+    f"{latest_date.strftime('%d %B %Y')}. "
+    "Batas rasio merupakan aturan awal yang perlu divalidasi."
+)
+
+# =========================
+# SIDEBAR FILTER
+# =========================
+st.sidebar.header("🔎 Filter Data")
+
+regions = sorted(
+    data["Region"].dropna().unique().tolist(),
+    key=str
+)
+
+categories = sorted(
+    data["Category"].dropna().unique().tolist(),
+    key=str
+)
+
+stores = sorted(
+    data["Store ID"].dropna().unique().tolist(),
+    key=str
+)
+
+selected_regions = st.sidebar.multiselect(
+    "Pilih Region",
+    options=regions,
+    default=regions
+)
+
+selected_categories = st.sidebar.multiselect(
+    "Pilih Kategori Produk",
+    options=categories,
+    default=categories
+)
+
+selected_stores = st.sidebar.multiselect(
+    "Pilih Store ID",
+    options=stores,
+    default=stores
+)
+
+# Filter snapshot tanggal terbaru
+filtered = latest_data[
+    latest_data["Region"].isin(selected_regions)
+    & latest_data["Category"].isin(selected_categories)
+    & latest_data["Store ID"].isin(selected_stores)
+].copy()
+
+# Filter seluruh data untuk analisis tren
+filtered_history = data[
+    data["Region"].isin(selected_regions)
+    & data["Category"].isin(selected_categories)
+    & data["Store ID"].isin(selected_stores)
+].copy()
+
+if filtered.empty:
+    st.warning(
+        "Tidak ada data untuk kombinasi filter yang dipilih. "
+        "Silakan ubah filter di sidebar."
+    )
+    st.stop()
+
+
+# =========================
+# RINGKASAN DASHBOARD
+# =========================
+st.subheader("📊 Ringkasan Persediaan Terbaru")
+
+total_produk_toko = len(filtered)
+
+prioritas_tinggi = (
+    filtered["Evaluasi Stok"] == "Prioritas tinggi"
+).sum()
+
+perlu_dipantau = (
+    filtered["Evaluasi Stok"] == "Perlu dipantau"
+).sum()
+
+stok_aman = (
+    filtered["Evaluasi Stok"] == "Stok relatif aman"
+).sum()
+
+stok_berlebih = (
+    filtered["Evaluasi Stok"] == "Evaluasi stok berlebih"
+).sum()
+
+col1, col2, col3, col4 = st.columns(4)
+
+col1.metric(
+    "Baris Produk-Toko",
+    f"{total_produk_toko:,}"
+)
+
+col2.metric(
+    "Prioritas Tinggi",
+    f"{prioritas_tinggi:,}"
+)
+
+col3.metric(
+    "Perlu Dipantau",
+    f"{perlu_dipantau:,}"
+)
+
+col4.metric(
+    "Evaluasi Stok Berlebih",
+    f"{stok_berlebih:,}"
+)
+
+st.divider()
+
+
+# =========================
+# DISTRIBUSI RISIKO
+# =========================
+st.subheader("📈 Distribusi Status Persediaan")
+
+risk_order = [
+    "Prioritas tinggi",
+    "Perlu dipantau",
+    "Stok relatif aman",
+    "Evaluasi stok berlebih",
+    "Demand nol"
+]
+
+risk_counts = (
+    filtered["Evaluasi Stok"]
+    .value_counts()
+    .reindex(risk_order, fill_value=0)
+)
+
+risk_chart = risk_counts[
+    risk_counts > 0
+].rename_axis("Status").reset_index(name="Jumlah")
+
+if not risk_chart.empty:
+    st.bar_chart(
+        risk_chart.set_index("Status")["Jumlah"]
+    )
+
+st.caption(
+    "Klasifikasi ini menggunakan rasio Inventory Level terhadap "
+    "Demand, bukan hasil prediksi stok habis yang telah divalidasi."
+)
+
+st.divider()
+
+
+# =========================
+# ANALISIS RISIKO KEKURANGAN STOK
+# =========================
+st.subheader("🚨 Risiko Kekurangan Stok")
+
+shortage_data = filtered[
+    filtered["Evaluasi Stok"].isin([
+        "Prioritas tinggi",
+        "Perlu dipantau"
+    ])
+].copy()
+
+shortage_data = shortage_data.sort_values(
+    by="Stock Ratio",
+    ascending=True,
+    na_position="last"
+)
+
+if shortage_data.empty:
+    st.success(
+        "Tidak ditemukan produk dengan status prioritas tinggi "
+        "atau perlu dipantau pada filter saat ini."
+    )
+else:
+    shortage_columns = [
+        "Store ID",
+        "Product ID",
+        "Category",
+        "Region",
+        "Inventory Level",
+        "Demand",
+        "Stock Ratio",
+        "Evaluasi Stok"
+    ]
+
+    st.dataframe(
+        shortage_data[shortage_columns],
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.write("**Rekomendasi awal:**")
+
+    st.write(
+        "- Periksa produk berstatus Prioritas Tinggi terlebih dahulu."
+    )
+    st.write(
+        "- Tinjau kebutuhan pemesanan berdasarkan demand dan "
+        "lead time pemasok."
+    )
+    st.write(
+        "- Periksa kembali data stok fisik sebelum melakukan pemesanan."
+    )
+
+st.divider()
+
+
+# =========================
+# ANALISIS POTENSI STOK BERLEBIH
+# =========================
+st.subheader("📦 Potensi Stok Berlebih")
+
+excess_data = filtered[
+    filtered["Evaluasi Stok"] == "Evaluasi stok berlebih"
+].copy()
+
+excess_data = excess_data.sort_values(
+    by="Stock Ratio",
+    ascending=False,
+    na_position="last"
+)
+
+if excess_data.empty:
+    st.info(
+        "Tidak ditemukan produk dengan rasio stok di atas "
+        "batas evaluasi pada filter saat ini."
+    )
+else:
+    excess_columns = [
+        "Store ID",
+        "Product ID",
+        "Category",
+        "Region",
+        "Inventory Level",
+        "Demand",
+        "Stock Ratio",
+        "Evaluasi Stok"
+    ]
+
+    st.dataframe(
+        excess_data[excess_columns],
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.write("**Rekomendasi awal:**")
+
+    st.write(
+        "- Periksa apakah persediaan sesuai dengan kebutuhan penjualan."
+    )
+    st.write(
+        "- Pertimbangkan pemindahan stok ke toko lain jika dibutuhkan."
+    )
+    st.write(
+        "- Evaluasi kembali jumlah pemesanan periode berikutnya."
+    )
+
+st.divider()
+
+
+# =========================
+# ANALISIS TREN DEMAND
+# =========================
+st.subheader("📉 Analisis Tren Demand")
+
+products = sorted(
+    filtered_history["Product ID"].dropna().unique().tolist(),
+    key=str
+)
+
+if products:
+    selected_product = st.selectbox(
+        "Pilih Product ID untuk melihat tren",
+        options=products
+    )
+
+    product_history = filtered_history[
+        filtered_history["Product ID"] == selected_product
+    ].copy()
+
+    product_history = (
+        product_history.groupby("Date", as_index=False)
+        .agg({
+            "Demand": "mean",
+            "Units Sold": "mean"
+        })
+        .sort_values("Date")
+    )
+
+    st.line_chart(
+        product_history.set_index("Date")[[
+            "Demand",
+            "Units Sold"
+        ]]
+    )
+
+    st.caption(
+        "Grafik menampilkan rata-rata Demand dan Units Sold "
+        "produk yang dipilih pada toko-toko dalam filter."
+    )
+
+st.divider()
+
+
+# =========================
+# RINGKASAN TREN PER PRODUK-TOKO
+# =========================
+st.subheader("📌 Perubahan Demand per Produk dan Toko")
+
+trend_latest = filtered[
+    [
+        "Store ID",
+        "Product ID",
+        "Category",
+        "Region",
+        "Rata-rata Demand 7 Hari",
+        "Perubahan Demand (%)"
+    ]
+].copy()
+
+trend_latest = trend_latest.sort_values(
+    by="Perubahan Demand (%)",
+    ascending=False,
+    na_position="last"
+)
+
+st.dataframe(
+    trend_latest,
+    use_container_width=True,
+    hide_index=True
+)
+
+st.caption(
+    "Perubahan demand dihitung dengan membandingkan rata-rata "
+    "7 data terakhir dan 7 data sebelumnya pada setiap produk-toko. "
+    "Jika data sebelumnya tidak tersedia atau bernilai nol, "
+    "perubahan ditampilkan sebagai nilai kosong."
+)
+
+st.divider()
+
+
+# =========================
+# TABEL DATA LENGKAP
+# =========================
+st.subheader("📋 Detail Persediaan Terbaru")
+
+detail_columns = [
+    "Date",
+    "Store ID",
+    "Product ID",
+    "Category",
+    "Region",
+    "Inventory Level",
+    "Units Sold",
+    "Units Ordered",
+    "Demand",
+    "Stock Ratio",
+    "Evaluasi Stok",
+    "Rata-rata Demand 7 Hari",
+    "Perubahan Demand (%)"
+]
+
+# Hanya tampilkan kolom yang tersedia
+detail_columns = [
+    col for col in detail_columns
+    if col in filtered.columns
+]
+
+st.dataframe(
+    filtered[detail_columns].sort_values(
+        by=["Store ID", "Product ID"],
+        key=lambda col: col.astype(str)
+    ),
+    use_container_width=True,
+    hide_index=True
+)
+
+
+# =========================
+# DOWNLOAD HASIL ANALISIS
+# =========================
+st.subheader("⬇️ Unduh Hasil Analisis")
+
+csv_data = filtered[detail_columns].to_csv(
+    index=False
+).encode("utf-8-sig")
+
+st.download_button(
+    label="Download Analisis Persediaan (CSV)",
+    data=csv_data,
+    file_name="analisis_persediaan.csv",
+    mime="text/csv"
+)
+
+st.caption(
+    "Catatan: batas rasio stok pada dashboard ini adalah asumsi awal. "
+    "Untuk keputusan operasional, validasi definisi Demand, periode "
+    "data, lead time pemasok, dan stok pengaman terlebih dahulu."
+)
