@@ -1,0 +1,8 @@
+streamlit
+pandas
+numpy
+openpyxl
+scikit-learn
+transformers
+accelerate
+torch
